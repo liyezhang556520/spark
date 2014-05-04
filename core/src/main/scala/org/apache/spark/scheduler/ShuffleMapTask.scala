@@ -28,6 +28,7 @@ import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.rdd.{RDD, RDDCheckpointData}
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.storage._
+import org.apache.spark.util.{AkkaUtils, Utils}
 
 private[spark] object ShuffleMapTask {
 
@@ -180,6 +181,7 @@ private[spark] class ShuffleMapTask(
       shuffleMetrics.shuffleBytesWritten = totalBytes
       shuffleMetrics.shuffleWriteTime = totalTime
       metrics.get.shuffleWriteMetrics = Some(shuffleMetrics)
+      logInfo("Shuffle Metrics Collected, StageId: %d, PartitionId: %d, shuffleBytesWritten: %s, shuffleWriteTime: %d s".format(stageId, partitionId, Utils.bytesToString(totalBytes), totalTime))
 
       success = true
       new MapStatus(blockManager.blockManagerId, compressedSizes)
