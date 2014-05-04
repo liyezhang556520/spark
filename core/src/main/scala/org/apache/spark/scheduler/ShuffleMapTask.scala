@@ -28,6 +28,7 @@ import org.apache.spark.executor.ShuffleWriteMetrics
 import org.apache.spark.rdd.{RDD, RDDCheckpointData}
 import org.apache.spark.serializer.Serializer
 import org.apache.spark.storage._
+import org.apache.spark.util.{AkkaUtils, Utils}
 
 private[spark] object ShuffleMapTask {
 
