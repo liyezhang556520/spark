@@ -28,7 +28,7 @@ import org.apache.spark.storage._
 import org.apache.spark.util.{MetadataCleanerType, TimeStampedHashMap, MetadataCleaner}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.rdd.RDDCheckpointData
-mport org.apache.spark.util.{AkkaUtils, Utils}
+import org.apache.spark.util.{AkkaUtils, Utils}
 
 private[spark] object ShuffleMapTask {
 
