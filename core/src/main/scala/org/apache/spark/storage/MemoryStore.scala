@@ -311,7 +311,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
     // Whether there is still enough memory for us to continue unrolling this block
     var keepPreUnrolling = true
     // How often to check whether we need to request more memory
-    val memoryCheckPeriod = 16
+    val memoryCheckPeriod = 1600000
     // Memory currently reserved by this thread for this particular unrolling operation
     // Initial value is 0 means don't reserve memory originally, only reserve dynamically
     var memoryThreshold = 0L
@@ -331,7 +331,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
       while (values.hasNext && keepPreUnrolling) {
 
         vector += values.next()
-        if (elementsUnrolled % memoryCheckPeriod == 0) {
+        if (elementsUnrolled % memoryCheckPeriod == 0 || !values.hasNext) {
                   
           // If our vector's size has exceeded the threshold, request more memory
           val currentSize = vector.estimateSize()
