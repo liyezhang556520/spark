@@ -326,6 +326,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
 
     // preUnroll this block safely, checking whether we have exceeded our threshold periodically
     try {
+logInfo(s"%%%%%%%%virtualCurrentMemory is ${virtualCurrentMemory}, reservedMemory is ${reservedMemory}, currentMemory is ${currentMemory},	preUnrollSpace is ${preUnrollSpace}, memoryToFreeForPreUnroll is ${memoryToFreeForPreUnroll}")
       while (values.hasNext && keepPreUnrolling) {
         vector += values.next()
         if (elementsUnrolled % memoryCheckPeriod == 0 || !values.hasNext) {
@@ -339,7 +340,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
               val memoryPreUnroll = preUnrollSpace + currentPreUnrollMemory
               val memoryToFree = memoryToFreeForPreUnroll + currentMemoryToDrop
 
-              //            logInfo(s"%%%%%%memoryThreshold is ${memoryThreshold}, memoryToFree is ${memoryToFree}, memoryToFreeByDroppingForThisThread is ${memoryToFreeByDroppingForThisThread}, memoryPreUnroll is ${memoryPreUnroll}, preUnrollSpaceForThisThread is ${preUnrollSpaceForThisThread}, freeMemory is ${freeMemory}") 
+                          logInfo(s"%%%%%%memoryThreshold is ${memoryThreshold}, memoryToFree is ${memoryToFree}, memoryPreUnroll is ${memoryPreUnroll}, freeMemory is ${freeMemory}") 
 
               if (freeMemory + memoryToFree - memoryPreUnroll < amountToRequest) {
                 // If the first request is not granted, try again after ensuring free space
@@ -366,7 +367,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
 
       if (keepPreUnrolling) {
         // to free up memory that requested more than needed
-        decreasePreUnrollMemoryForThisThread(memoryThreshold - vector.estimateSize())
+        decreasePreUnrollMemoryForThisThread(memoryThreshold - SizeEstimator.estimate(vector.toArray.asInstanceOf[AnyRef]))
         // We successfully unrolled the entirety of this block
         Left(vector.toArray)
       } else {
@@ -528,9 +529,14 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
           entries.put(blockId, entry)
           if (memoryToFreeForPreUnroll > 0) {
             memoryToFreeForPreUnroll -= virtualCurrentMemory - currentMemory
+            if (memoryToFreeForPreUnroll < 0) {
+              memoryToFreeForPreUnroll = 0
+            }
           }
           if (preUnrollSpace > 0) {
+            logInfo(s" caocaocaocaocao preUnrollSpace is ${preUnrollSpace}, size is ${size}")
             preUnrollSpace -= size
+            logInfo(s" caocaocaocaocaocao preUnrollSpace is ${preUnrollSpace}")
           }
           currentMemory += size
           virtualCurrentMemory = currentMemory
