@@ -21,7 +21,7 @@ import java.nio.ByteBuffer
 import java.util.LinkedHashMap
 
 import scala.collection.mutable
-import scala.collection.mutable.ArrayBuffer
+import scala.collection.mutable.{ArrayBuffer, HashSet}
 
 import org.apache.spark.util.{SizeEstimator, Utils}
 import org.apache.spark.util.collection.SizeTrackingVector
@@ -37,8 +37,11 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
 
   private val conf = blockManager.conf
   private val entries = new LinkedHashMap[BlockId, MemoryEntry](32, 0.75f, true)
+  private val tobeDroppedBlocksSet = new HashSet[BlockId]
 
+  // currentMemory is actually memory that is already used for caching blocks
   @volatile private var currentMemory = 0L
+  @volatile private var safeCurrentMemory = 0L
 
   // Ensure only one thread is putting, and if necessary, dropping blocks at any given time
   private val accountingLock = new Object
@@ -46,6 +49,14 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   // A mapping from thread ID to amount of memory used for unrolling a block (in bytes)
   // All accesses of this map are assumed to have manually synchronized on `accountingLock`
   private val unrollMemoryMap = mutable.HashMap[Long, Long]()
+  
+    // A mapping from thread ID to amount of memory used for unrolling a block (in bytes)
+  // All accesses of this map are assumed to have manually synchronized on `accountingLock`
+  private val toDropMemoryMap = mutable.HashMap[Long, Long]()
+  
+  private val tryToPutMemoryMap = mutable.HashMap[Long, Long]()
+  
+  private val droppedMemoryMap = mutable.HashMap[Long, Long]()
 
   /**
    * The amount of space ensured for unrolling values in memory, shared across all cores.
@@ -58,8 +69,17 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
 
   logInfo("MemoryStore started with capacity %s".format(Utils.bytesToString(maxMemory)))
 
-  /** Free memory not occupied by existing blocks. Note that this does not include unroll memory. */
-  def freeMemory: Long = maxMemory - currentMemory
+  /**
+   *  Free memory not occupied by existing blocks. Note that this does not include reserved 
+   *  memory for new blocks.
+   */
+  def freeMemory: Long = maxMemory - (
+      safeCurrentMemory + currentTryToPutMemory - currentToDropMemory)
+  
+  def freeMemoryForUnroll: Long = maxMemory - (
+      safeCurrentMemory + currentTryToPutMemory + currentUnrollMemory - currentToDropMemory)
+  
+
 
   override def getSize(blockId: BlockId): Long = {
     entries.synchronized {
@@ -123,7 +143,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
       returnValues: Boolean,
       allowPersistToDisk: Boolean): PutResult = {
     val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
-    val unrolledValues = unrollSafely(blockId, values, droppedBlocks)
+    val unrolledValues = preUnrollSafely(blockId, values, droppedBlocks)
     unrolledValues match {
       case Left(arrayValues) =>
         // Values are fully unrolled in memory, so store them as an array
@@ -173,8 +193,10 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
 
   override def remove(blockId: BlockId): Boolean = {
     entries.synchronized {
+      tobeDroppedBlocksSet.remove(blockId)
       val entry = entries.remove(blockId)
       if (entry != null) {
+        increaseDroppedMemoryForThisThread(entry.size)
         currentMemory -= entry.size
         logInfo(s"Block $blockId of size ${entry.size} dropped from memory (free $freeMemory)")
         true
@@ -187,7 +209,9 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   override def clear() {
     entries.synchronized {
       entries.clear()
+      tobeDroppedBlocksSet.clear()
       currentMemory = 0
+      safeCurrentMemory = currentMemory
     }
     logInfo("MemoryStore cleared")
   }
@@ -204,77 +228,107 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    * This method returns either an array with the contents of the entire block or an iterator
    * containing the values of the block (if the array would have exceeded available memory).
    */
-  def unrollSafely(
-      blockId: BlockId,
-      values: Iterator[Any],
-      droppedBlocks: ArrayBuffer[(BlockId, BlockStatus)])
-    : Either[Array[Any], Iterator[Any]] = {
+
+  def preUnrollSafely(
+    blockId: BlockId,
+    values: Iterator[Any],
+    droppedBlocks: ArrayBuffer[(BlockId, BlockStatus)]): Either[Array[Any], Iterator[Any]] = {
 
     // Number of elements unrolled so far
-    var elementsUnrolled = 0
+    var elementsUnrolled = 0L
     // Whether there is still enough memory for us to continue unrolling this block
     var keepUnrolling = true
-    // Initial per-thread memory to request for unrolling blocks (bytes). Exposed for testing.
-    val initialMemoryThreshold = conf.getLong("spark.storage.unrollMemoryThreshold", 1024 * 1024)
     // How often to check whether we need to request more memory
     val memoryCheckPeriod = 16
     // Memory currently reserved by this thread for this particular unrolling operation
-    var memoryThreshold = initialMemoryThreshold
+    // Initial value is 0 means don't reserve memory originally, only reserve dynamically
+    var memoryThreshold = 0L
     // Memory to request as a multiple of current vector size
     val memoryGrowthFactor = 1.5
-    // Previous unroll memory held by this thread, for releasing later (only at the very end)
-    val previousMemoryReserved = currentUnrollMemoryForThisThread
     // Underlying vector for unrolling the block
     var vector = new SizeTrackingVector[Any]
 
-    // Request enough memory to begin unrolling
-    keepUnrolling = reserveUnrollMemoryForThisThread(initialMemoryThreshold)
-
-    // Unroll this block safely, checking whether we have exceeded our threshold periodically
+    // preUnroll this block safely, checking whether we have exceeded our threshold periodically
     try {
+      logInfo(s"%%%%%%%%safeCurrentMemory is ${safeCurrentMemory}, currentMemory is ${currentMemory},	currentTryToPutMemory is ${currentTryToPutMemory}, currentUnrollMemory is ${currentUnrollMemory}, currentToDropMemory is ${currentToDropMemory}")
       while (values.hasNext && keepUnrolling) {
         vector += values.next()
-        if (elementsUnrolled % memoryCheckPeriod == 0) {
+        if (elementsUnrolled % memoryCheckPeriod == 0 || !values.hasNext) {
+
           // If our vector's size has exceeded the threshold, request more memory
           val currentSize = vector.estimateSize()
-          if (currentSize >= memoryThreshold) {
+          if (currentSize > memoryThreshold) {
+            //            logInfo(s"***vector size is ${currentSize} ")
             val amountToRequest = (currentSize * memoryGrowthFactor - memoryThreshold).toLong
-            // Hold the accounting lock, in case another thread concurrently puts a block that
-            // takes up the unrolling space we just ensured here
+
             accountingLock.synchronized {
-              if (!reserveUnrollMemoryForThisThread(amountToRequest)) {
-                // If the first request is not granted, try again after ensuring free space
-                // If there is still not enough space, give up and drop the partition
-                val spaceToEnsure = maxUnrollMemory - currentUnrollMemory
-                if (spaceToEnsure > 0) {
-                  val result = ensureFreeSpace(blockId, spaceToEnsure)
-                  droppedBlocks ++= result.droppedBlocks
+              logInfo(s"freeMemoryForUnroll is ${freeMemoryForUnroll}, amountToRequest is ${amountToRequest}")
+              if (freeMemoryForUnroll < amountToRequest) {
+                var selectedMemory = 0L
+                val selectedBlocks = new ArrayBuffer[BlockId]()
+
+                val ensureSpaceResult = ensureFreeSpaceForUnroll(blockId, amountToRequest)
+
+                val enoughFreeSpace = ensureSpaceResult.success
+                if (enoughFreeSpace) {
+                  selectedBlocks ++= ensureSpaceResult.toDropBlocksId
+                  selectedMemory = ensureSpaceResult.selectedMemory
+                  if (!selectedBlocks.isEmpty) {
+                    for (selectedblockId <- selectedBlocks) {
+                      val entry = entries.synchronized { entries.get(selectedblockId) }
+                      // This should never be null as only one thread should be dropping
+                      // blocks and removing entries. However the check is still here for
+                      // future safety.
+                      if (entry != null) {
+                        val data = if (entry.deserialized) {
+                          Left(entry.value.asInstanceOf[Array[Any]])
+                        } else {
+                          Right(entry.value.asInstanceOf[ByteBuffer].duplicate())
+                        }
+                        val droppedBlockStatus = blockManager.dropFromMemory(selectedblockId, data)
+                        droppedBlockStatus.foreach { status => droppedBlocks += ((selectedblockId, status)) }
+                      }
+                    }
+                  }
+                  accountingLock.synchronized {
+                    updateToDropMemory
+                    increaseUnrollMemoryForThisThread(amountToRequest)
+                    safeCurrentMemory = currentMemory
+                  }
+                } else {
+                  keepUnrolling = false
                 }
-                keepUnrolling = reserveUnrollMemoryForThisThread(amountToRequest)
+              } else {
+                increaseUnrollMemoryForThisThread(amountToRequest)
               }
             }
-            // New threshold is currentSize * memoryGrowthFactor
-            memoryThreshold += amountToRequest
+            if (keepUnrolling) {
+              memoryThreshold += amountToRequest
+            }
           }
         }
         elementsUnrolled += 1
       }
+      logInfo(s"going to out of the func %%%%%%%%safeCurrentMemory is ${safeCurrentMemory}, currentMemory is ${currentMemory},	currentTryToPutMemory is ${currentTryToPutMemory}, currentUnrollMemory is ${currentUnrollMemory}, currentToDropMemory is ${currentToDropMemory}")
 
       if (keepUnrolling) {
+        // to free up memory that requested more than needed
+        decreaseUnrollMemoryForThisThread(memoryThreshold - SizeEstimator.estimate(vector.toArray.asInstanceOf[AnyRef]))
+        logInfo(s"successfully unrolloing the block, blockID is ${blockId}, size is ${SizeEstimator.estimate(vector.toArray.asInstanceOf[AnyRef])}")
         // We successfully unrolled the entirety of this block
         Left(vector.toArray)
       } else {
         // We ran out of space while unrolling the values for this block
+        logInfo(s"failed unrolloing the block, blockID is ${blockId}")
         Right(vector.iterator ++ values)
       }
-
     } finally {
-      // If we return an array, the values returned do not depend on the underlying vector and
-      // we can immediately free up space for other threads. Otherwise, if we return an iterator,
-      // we release the memory claimed by this thread later on when the task finishes.
-      if (keepUnrolling) {
-        val amountToRelease = currentUnrollMemoryForThisThread - previousMemoryReserved
-        releaseUnrollMemoryForThisThread(amountToRelease)
+      accountingLock.synchronized {
+        if (!keepUnrolling) {
+          removeUnrollMemoryForThisThread
+          removeToDropMemoryForThisThread
+        }
+
       }
     }
   }
@@ -298,11 +352,13 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    *
    * Return whether put was successful, along with the blocks dropped in the process.
    */
+
   private def tryToPut(
-      blockId: BlockId,
-      value: Any,
-      size: Long,
-      deserialized: Boolean): ResultWithDroppedBlocks = {
+    blockId: BlockId,
+    value: Any,
+    size: Long,
+    deserialized: Boolean): ResultWithDroppedBlocks = {
+
 
     /* TODO: Its possible to optimize the locking by locking entries only when selecting blocks
      * to be dropped. Once the to-be-dropped blocks have been selected, and lock on entries has
@@ -311,35 +367,63 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
      * dropping of blocks (and writing to disk if necessary) can proceed in parallel. */
 
     var putSuccess = false
+    var enoughFreeSpace = false
     val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
+    var selectedMemory = 0L
+    val selectedBlocks = new ArrayBuffer[BlockId]()
 
-    accountingLock.synchronized {
-      val freeSpaceResult = ensureFreeSpace(blockId, size)
-      val enoughFreeSpace = freeSpaceResult.success
-      droppedBlocks ++= freeSpaceResult.droppedBlocks
-
-      if (enoughFreeSpace) {
-        val entry = new MemoryEntry(value, size, deserialized)
-        entries.synchronized {
-          entries.put(blockId, entry)
-          currentMemory += size
+    val freeSpaceResult = ensureFreeSpaceForTryToPut(blockId, size)
+    enoughFreeSpace = freeSpaceResult.success
+    if (enoughFreeSpace) {
+      selectedBlocks ++= freeSpaceResult.toDropBlocksId
+      selectedMemory = freeSpaceResult.selectedMemory
+      if (!selectedBlocks.isEmpty) {
+        for (selectedblockId <- selectedBlocks) {
+          val entry = entries.synchronized { entries.get(selectedblockId) }
+          // This should never be null as only one thread should be dropping
+          // blocks and removing entries. However the check is still here for
+          // future safety.
+          if (entry != null) {
+            val data = if (entry.deserialized) {
+              Left(entry.value.asInstanceOf[Array[Any]])
+            } else {
+              Right(entry.value.asInstanceOf[ByteBuffer].duplicate())
+            }
+            val droppedBlockStatus = blockManager.dropFromMemory(selectedblockId, data)
+            droppedBlockStatus.foreach { status => droppedBlocks += ((selectedblockId, status)) }
+          }
         }
-        val valuesOrBytes = if (deserialized) "values" else "bytes"
-        logInfo("Block %s stored as %s in memory (estimated size %s, free %s)".format(
-          blockId, valuesOrBytes, Utils.bytesToString(size), Utils.bytesToString(freeMemory)))
-        putSuccess = true
-      } else {
-        // Tell the block manager that we couldn't put it in memory so that it can drop it to
-        // disk if the block allows disk storage.
-        val data = if (deserialized) {
-          Left(value.asInstanceOf[Array[Any]])
-        } else {
-          Right(value.asInstanceOf[ByteBuffer].duplicate())
-        }
-        val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
-        droppedBlockStatus.foreach { status => droppedBlocks += ((blockId, status)) }
       }
+
+      val entry = new MemoryEntry(value, size, deserialized)
+      entries.synchronized {
+        entries.put(blockId, entry)
+
+        decreaseTryToPutMemoryForThisThread(size)
+        updateToDropMemory
+
+        currentMemory += size
+        safeCurrentMemory = currentMemory
+      }
+      val valuesOrBytes = if (deserialized) "values" else "bytes"
+      logInfo("Block %s stored as %s in memory (estimated size %s, free %s)".format(
+        blockId, valuesOrBytes, Utils.bytesToString(size), Utils.bytesToString(freeMemory)))
+      putSuccess = true
+    } else {
+      logInfo(s"failing to puth block id : ${blockId} to memory, will drop to disk")
+      logInfo(s"current block to be dropped size is ${size}")
+      removeUnrollMemoryForThisThread
+      // Tell the block manager that we couldn't put it in memory so that it can drop it to
+      // disk if the block allows disk storage.
+      val data = if (deserialized) {
+        Left(value.asInstanceOf[Array[Any]])
+      } else {
+        Right(value.asInstanceOf[ByteBuffer].duplicate())
+      }
+      val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
+      droppedBlockStatus.foreach { status => droppedBlocks += ((blockId, status)) }
     }
+
     ResultWithDroppedBlocks(putSuccess, droppedBlocks)
   }
 
@@ -354,67 +438,119 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    *
    * Return whether there is enough free space, along with the blocks dropped in the process.
    */
-  private def ensureFreeSpace(
-      blockIdToAdd: BlockId,
-      space: Long): ResultWithDroppedBlocks = {
-    logInfo(s"ensureFreeSpace($space) called with curMem=$currentMemory, maxMem=$maxMemory")
 
+  /**
+   * Assume that `accountingLock` is held by the caller to ensure only one thread is dropping
+   * blocks. Otherwise, the freed space may fill up before the caller puts in their new value.
+   */
+  private def ensureFreeSpaceForTryToPut(
+    blockIdToAdd: BlockId,
+    size: Long): ResultBlocksIdMemory = {
+    logInfo(s"ensureFreeSpace($size) called with curMem=$currentMemory, maxMem=$maxMemory")
+
+    var putSuccess = false
+    var enoughFreeSpace = false
     val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
+    var selectedMemory = 0L
+    val selectedBlocks = new ArrayBuffer[BlockId]()
 
-    if (space > maxMemory) {
+    if (size > maxMemory) {
       logInfo(s"Will not store $blockIdToAdd as it is larger than our memory limit")
-      return ResultWithDroppedBlocks(success = false, droppedBlocks)
-    }
-
-    // Take into account the amount of memory currently occupied by unrolling blocks
-    val actualFreeMemory = freeMemory - currentUnrollMemory
-
-    if (actualFreeMemory < space) {
-      val rddToAdd = getRddId(blockIdToAdd)
-      val selectedBlocks = new ArrayBuffer[BlockId]
-      var selectedMemory = 0L
-
+      ResultBlocksIdMemory(success = false, selectedBlocks.toSeq, selectedMemory)
+    } else {
+      logInfo(s"tobe dropped blockset is ${tobeDroppedBlocksSet.toArray}")
+      logInfo(s",,,,,,,freeMemory is ${freeMemory}, safeCurrentMemory is ${safeCurrentMemory}, currentMemory is ${currentMemory}")
       // This is synchronized to ensure that the set of entries is not changed
       // (because of getValue or getBytes) while traversing the iterator, as that
       // can lead to exceptions.
       entries.synchronized {
-        val iterator = entries.entrySet().iterator()
-        while (actualFreeMemory + selectedMemory < space && iterator.hasNext) {
-          val pair = iterator.next()
-          val blockId = pair.getKey
-          if (rddToAdd.isEmpty || rddToAdd != getRddId(blockId)) {
-            selectedBlocks += blockId
-            selectedMemory += pair.getValue.size
-          }
-        }
-      }
-
-      if (actualFreeMemory + selectedMemory >= space) {
-        logInfo(s"${selectedBlocks.size} blocks selected for dropping")
-        for (blockId <- selectedBlocks) {
-          val entry = entries.synchronized { entries.get(blockId) }
-          // This should never be null as only one thread should be dropping
-          // blocks and removing entries. However the check is still here for
-          // future safety.
-          if (entry != null) {
-            val data = if (entry.deserialized) {
-              Left(entry.value.asInstanceOf[Array[Any]])
-            } else {
-              Right(entry.value.asInstanceOf[ByteBuffer].duplicate())
+        if (freeMemory < size) {
+          val rddToAdd = getRddId(blockIdToAdd)
+          val iterator = entries.entrySet().iterator()
+          while (freeMemory + selectedMemory < size && iterator.hasNext) {
+            val pair = iterator.next()
+            val blockId = pair.getKey
+            if (!tobeDroppedBlocksSet.contains(blockId)) {
+              if (rddToAdd.isEmpty || rddToAdd != getRddId(blockId)) {
+                selectedBlocks += blockId
+                selectedMemory += pair.getValue.size
+              }
             }
-            val droppedBlockStatus = blockManager.dropFromMemory(blockId, data)
-            droppedBlockStatus.foreach { status => droppedBlocks += ((blockId, status)) }
           }
         }
-        return ResultWithDroppedBlocks(success = true, droppedBlocks)
-      } else {
-        logInfo(s"Will not store $blockIdToAdd as it would require dropping another block " +
-          "from the same RDD")
-        return ResultWithDroppedBlocks(success = false, droppedBlocks)
+        if (freeMemory + selectedMemory >= size) {
+          tobeDroppedBlocksSet ++= selectedBlocks
+          increaseTryToPutMemoryForThisThread(size)
+          decreaseUnrollMemoryForThisThread(size)
+          increaseToDropMemoryForThisThread(selectedMemory)
+          enoughFreeSpace = true
+          logInfo(selectedBlocks.size + " blocks selected for dropping")
+          ResultBlocksIdMemory(success = true, selectedBlocks.toSeq, selectedMemory)
+
+        } else {
+          logInfo(s"ensureFreeSpaceForTryToPut Will not store $blockIdToAdd as it would require dropping another block " +
+            "from the same RDD")
+          ResultBlocksIdMemory(success = false, selectedBlocks.toSeq, selectedMemory)
+        }
       }
     }
-    ResultWithDroppedBlocks(success = true, droppedBlocks)
+
   }
+
+  /**
+   * Assume that `accountingLock` is held by the caller to ensure only one thread is dropping
+   * blocks. Otherwise, the freed space may fill up before the caller puts in their new value.
+   */
+  private def ensureFreeSpaceForUnroll(
+    blockIdToAdd: BlockId,
+    size: Long): ResultBlocksIdMemory = {
+    logInfo(s"ensureFreeSpace($size) called with curMem=$currentMemory, maxMem=$maxMemory")
+
+    var putSuccess = false
+    var enoughFreeSpace = false
+    val droppedBlocks = new ArrayBuffer[(BlockId, BlockStatus)]
+    var selectedMemory = 0L
+    val selectedBlocks = new ArrayBuffer[BlockId]()
+
+    if (size > maxMemory) {
+      logInfo(s"Will not store $blockIdToAdd as it is larger than our memory limit")
+      ResultBlocksIdMemory(success = false, selectedBlocks.toSeq, selectedMemory)
+    } else {
+      // This is synchronized to ensure that the set of entries is not changed
+      // (because of getValue or getBytes) while traversing the iterator, as that
+      // can lead to exceptions.
+      entries.synchronized {
+        if (freeMemoryForUnroll < size) {
+          val rddToAdd = getRddId(blockIdToAdd)
+          val iterator = entries.entrySet().iterator()
+          while (freeMemory + selectedMemory < size && iterator.hasNext) {
+            val pair = iterator.next()
+            val blockId = pair.getKey
+            if (!tobeDroppedBlocksSet.contains(blockId)) {
+              if (rddToAdd.isEmpty || rddToAdd != getRddId(blockId)) {
+                selectedBlocks += blockId
+                selectedMemory += pair.getValue.size
+              }
+            }
+          }
+        }
+        if (freeMemoryForUnroll + selectedMemory >= size) {
+logInfo(s"in ensureFreeSpaceForUnroll, ensuresize is ${size}, selected Memory is ${selectedMemory} freeMemoryForUnroll is ${freeMemoryForUnroll}")
+          tobeDroppedBlocksSet ++= selectedBlocks
+          increaseUnrollMemoryForThisThread(size)
+          increaseToDropMemoryForThisThread(selectedMemory)
+          enoughFreeSpace = true
+          logInfo(selectedBlocks.size + " blocks selected for dropping")
+          ResultBlocksIdMemory(success = true, selectedBlocks.toSeq, selectedMemory)
+        } else {
+          logInfo(s"Will not store $blockIdToAdd as it would require dropping another block " +
+            "from the same RDD")
+          ResultBlocksIdMemory(success = false, selectedBlocks.toSeq, selectedMemory)
+        }
+      }
+    }
+  }
+
 
   override def contains(blockId: BlockId): Boolean = {
     entries.synchronized { entries.containsKey(blockId) }
@@ -424,14 +560,10 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    * Reserve additional memory for unrolling blocks used by this thread.
    * Return whether the request is granted.
    */
-  private[spark] def reserveUnrollMemoryForThisThread(memory: Long): Boolean = {
+  private[spark] def increaseToDropMemoryForThisThread(memory: Long): Unit = {
+    val threadId = Thread.currentThread().getId
     accountingLock.synchronized {
-      val granted = freeMemory > currentUnrollMemory + memory
-      if (granted) {
-        val threadId = Thread.currentThread().getId
-        unrollMemoryMap(threadId) = unrollMemoryMap.getOrElse(threadId, 0L) + memory
-      }
-      granted
+      toDropMemoryMap(threadId) = toDropMemoryMap.getOrElse(threadId, 0L) + memory
     }
   }
 
@@ -439,13 +571,76 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
    * Release memory used by this thread for unrolling blocks.
    * If the amount is not specified, remove the current thread's allocation altogether.
    */
-  private[spark] def releaseUnrollMemoryForThisThread(memory: Long = -1L): Unit = {
+  private[spark] def decreaseToDropMemoryForThisThread(memory: Long = -1L): Unit = {
+    val threadId = Thread.currentThread().getId
+    accountingLock.synchronized {
+      toDropMemoryMap(threadId) = toDropMemoryMap.getOrElse(threadId, 0L) - memory
+      // If this thread claims no more unroll memory, release it completely
+      if (toDropMemoryMap(threadId) <= 0) {
+        toDropMemoryMap.remove(threadId)
+      }
+    }
+  }
+
+  private[spark] def decreaseToDropMemory(threadId: Long, memory: Long = -1L): Unit = {
+    accountingLock.synchronized {
+      toDropMemoryMap(threadId) = toDropMemoryMap.getOrElse(threadId, 0L) - memory
+      // If this thread claims no more unroll memory, release it completely
+      if (toDropMemoryMap(threadId) <= 0) {
+        toDropMemoryMap.remove(threadId)
+      }
+    }
+  }
+  private[spark] def updateToDropMemory: Unit = {
+    accountingLock.synchronized {
+      val threadIds = droppedMemoryMap.keySet
+      for (threadId <- threadIds) {
+        decreaseToDropMemory(threadId, droppedMemoryMap.getOrElse(threadId, 0L))
+        droppedMemoryMap.remove(threadId)
+      }
+    }
+  }
+
+  /**
+   * Return the amount of memory currently occupied for unrolling blocks across all threads.
+   */
+  private[spark] def currentToDropMemory: Long = accountingLock.synchronized {
+    toDropMemoryMap.values.sum
+  }
+
+  /**
+   *
+   */
+  private[spark] def currentToDropMemoryForThisThread: Long = accountingLock.synchronized {
+    toDropMemoryMap.getOrElse(Thread.currentThread().getId, 0L)
+  }
+
+  private[spark] def removeToDropMemoryForThisThread: Unit = accountingLock.synchronized {
+    toDropMemoryMap.remove(Thread.currentThread().getId)
+  }
+
+  /**
+   * Reserve additional memory for unrolling blocks used by this thread.
+   * Return whether the request is granted.
+   */
+  private[spark] def increaseUnrollMemoryForThisThread(memory: Long): Unit = {
+    accountingLock.synchronized {
+      val threadId = Thread.currentThread().getId
+      unrollMemoryMap(threadId) = unrollMemoryMap.getOrElse(threadId, 0L) + memory
+    }
+  }
+
+  /**
+   * Release memory used by this thread for unrolling blocks.
+   * If the amount is not specified, remove the current thread's allocation altogether.
+   */
+  private[spark] def decreaseUnrollMemoryForThisThread(memory: Long = -1L): Unit = {
     val threadId = Thread.currentThread().getId
     accountingLock.synchronized {
       if (memory < 0) {
         unrollMemoryMap.remove(threadId)
       } else {
-        unrollMemoryMap(threadId) = unrollMemoryMap.getOrElse(threadId, memory) - memory
+        unrollMemoryMap(threadId) = unrollMemoryMap.getOrElse(threadId, 0L) - memory
         // If this thread claims no more unroll memory, release it completely
         if (unrollMemoryMap(threadId) <= 0) {
           unrollMemoryMap.remove(threadId)
@@ -467,8 +662,76 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
   private[spark] def currentUnrollMemoryForThisThread: Long = accountingLock.synchronized {
     unrollMemoryMap.getOrElse(Thread.currentThread().getId, 0L)
   }
+
+  private[spark] def removeUnrollMemoryForThisThread: Unit = accountingLock.synchronized {
+    unrollMemoryMap.remove(Thread.currentThread().getId)
+  }
+
+  /**
+   * Reserve additional memory for unrolling blocks used by this thread.
+   * Return whether the request is granted.
+   */
+  private[spark] def increaseTryToPutMemoryForThisThread(memory: Long): Unit = {
+    val threadId = Thread.currentThread().getId
+    accountingLock.synchronized {
+      tryToPutMemoryMap(threadId) = tryToPutMemoryMap.getOrElse(threadId, 0L) + memory
+    }
+  }
+
+  /**
+   * Release memory used by this thread for unrolling blocks.
+   * If the amount is not specified, remove the current thread's allocation altogether.
+   */
+  private[spark] def decreaseTryToPutMemoryForThisThread(memory: Long = -1L): Unit = {
+    val threadId = Thread.currentThread().getId
+    accountingLock.synchronized {
+      tryToPutMemoryMap(threadId) = tryToPutMemoryMap.getOrElse(threadId, memory) - memory
+      // If this thread claims no more unroll memory, release it completely
+      if (tryToPutMemoryMap(threadId) <= 0) {
+        tryToPutMemoryMap.remove(threadId)
+      }
+    }
+  }
+
+  /**
+   * Return the amount of memory currently occupied for unrolling blocks across all threads.
+   */
+  private[spark] def currentTryToPutMemory: Long = accountingLock.synchronized {
+    tryToPutMemoryMap.values.sum
+  }
+
+  /**
+   *
+   */
+  private[spark] def currentTryToPutMemoryForThisThread: Long = accountingLock.synchronized {
+    tryToPutMemoryMap.getOrElse(Thread.currentThread().getId, 0L)
+  }
+
+  private[spark] def removeTryToPutMemoryForThisThread: Unit = accountingLock.synchronized {
+    tryToPutMemoryMap.remove(Thread.currentThread().getId)
+  }
+
+  private[spark] def increaseDroppedMemoryForThisThread(memory: Long): Unit = {
+    val threadId = Thread.currentThread().getId
+    accountingLock.synchronized {
+      droppedMemoryMap(threadId) = droppedMemoryMap.getOrElse(threadId, 0L) + memory
+    }
+  }
+      
+//          private[spark] def removeDroppedMemoryForThisThread: Unit = accountingLock.synchronized {
+//    droppedMemoryMap.remove(Thread.currentThread().getId)
+//    }
+    
+    
+    
+    
 }
 
 private[spark] case class ResultWithDroppedBlocks(
     success: Boolean,
     droppedBlocks: Seq[(BlockId, BlockStatus)])
+    
+private[spark] case class ResultBlocksIdMemory(
+    success: Boolean,    
+    toDropBlocksId: Seq[BlockId],
+    selectedMemory: Long)
