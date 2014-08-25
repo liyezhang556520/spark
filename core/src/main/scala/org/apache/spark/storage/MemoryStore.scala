@@ -259,7 +259,6 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
             //            logInfo(s"***vector size is ${currentSize} ")
             val amountToRequest = (currentSize * memoryGrowthFactor - memoryThreshold).toLong
 
-            entries.synchronized {
               logInfo(s"thread id is ${Thread.currentThread().getId}, freeMemoryForUnroll is ${freeMemoryForUnroll}, amountToRequest is ${amountToRequest}, memoryThreshold is ${memoryThreshold}")
               if (freeMemoryForUnroll < amountToRequest) {
                 var selectedMemory = 0L
@@ -295,7 +294,7 @@ private[spark] class MemoryStore(blockManager: BlockManager, maxMemory: Long)
               } else {
                 increaseUnrollMemoryForThisThread(amountToRequest)
               }
-            }
+
             if (keepUnrolling) {
               memoryThreshold += amountToRequest
             }
