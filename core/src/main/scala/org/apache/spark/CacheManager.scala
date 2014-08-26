@@ -158,7 +158,7 @@ private[spark] class CacheManager(blockManager: BlockManager) extends Logging {
        * single partition. Instead, we unroll the values cautiously, potentially aborting and
        * dropping the partition to disk if applicable.
        */
-      blockManager.memoryStore.preUnrollSafely(key, values, updatedBlocks) match {
+      blockManager.memoryStore.unrollSafely(key, values, updatedBlocks) match {
         case Left(arr) =>
           // We have successfully unrolled the entire partition, so cache it in memory
           updatedBlocks ++=
