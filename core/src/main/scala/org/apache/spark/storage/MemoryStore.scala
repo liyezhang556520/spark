@@ -289,7 +289,8 @@ logInfo(s"thread id is ${Thread.currentThread().getId}, freeMemoryForUnroll is "
             if (freeMemoryForUnroll < amountToRequest) {
               var selectedMemory = 0L
               val selectedBlocks = new ArrayBuffer[BlockId]()
-              val ensureSpaceResult = ensureFreeSpaceForUnroll(blockId, amountToRequest)
+              val ensureSpaceResult = ensureFreeSpace(
+                  blockId, amountToRequest, freeMemoryForUnroll, true)
               val enoughFreeSpace = ensureSpaceResult.success
               
               if (enoughFreeSpace) {
@@ -354,6 +355,8 @@ logInfo(s"successfully unrolloing the block, blockID is ${blockId}, size is " +
           removeUnrollMemoryForThisThread
           removeToDropMemoryForThisThread
         }
+
+        cleanToDropBlocksMapForThisThread
         // We will finally reset the ReservedUnrollMemory for current thread. The memory should 
         // always be 0 after dropping the selected blocks.
         removeReservedUnrollMemoryForThisThread
@@ -392,7 +395,7 @@ logInfo(s".....start try to put, tobeDroppedBlocksSet set size is ${tobeDroppedB
     var selectedMemory = 0L
     val selectedBlocks = new ArrayBuffer[BlockId]()
 
-    val freeSpaceResult = ensureFreeSpaceForTryToPut(blockId, size)
+    val freeSpaceResult = ensureFreeSpace(blockId, size, freeMemory, false)
     enoughFreeSpace = freeSpaceResult.success
     if (enoughFreeSpace) {
       selectedBlocks ++= freeSpaceResult.toDropBlocksId
@@ -460,9 +463,11 @@ logInfo(s"current block to be dropped size is ${size}")
    * Assume that `accountingLock` is held by the caller to ensure only one thread is dropping
    * blocks. Otherwise, the freed space may fill up before the caller puts in their new value.
    */
-  private def ensureFreeSpaceForTryToPut(
+  private def ensureFreeSpace(
     blockIdToAdd: BlockId,
-    size: Long): ResultBlocksIdMemory = {
+    size: Long,
+    memoryFree: Long,
+    isUnroll: Boolean): ResultBlocksIdMemory = {
     logInfo(s"ensureFreeSpace($size) called with curMem=$currentMemory, maxMem=$maxMemory")
 
     var putSuccess = false
@@ -482,10 +487,10 @@ logInfo(s",,,,,,,freeMemory is ${freeMemory}, currentMemory is ${currentMemory},
       // (because of getValue or getBytes) while traversing the iterator, as that
       // can lead to exceptions.
       entries.synchronized {
-        if (freeMemory < size) {
+        if (memoryFree < size) {
           val rddToAdd = getRddId(blockIdToAdd)
           val iterator = entries.entrySet().iterator()
-          while (freeMemory + selectedMemory < size && iterator.hasNext) {
+          while (memoryFree + selectedMemory < size && iterator.hasNext) {
             val pair = iterator.next()
             val blockId = pair.getKey
             if (!tobeDroppedBlocksSet.contains(blockId)) {
@@ -496,16 +501,20 @@ logInfo(s",,,,,,,freeMemory is ${freeMemory}, currentMemory is ${currentMemory},
             }
           }
         }
-        if (freeMemory + selectedMemory >= size) {
+        if (memoryFree + selectedMemory >= size) {
           tobeDroppedBlocksSet ++= selectedBlocks
           addToDropBlocksMapForThisThread(selectedBlocks.toArray)
-          increaseTryToPutMemoryForThisThread(size)
-          decreaseUnrollMemoryForThisThread(size)
           increaseToDropMemoryForThisThread(selectedMemory)
+          if (isUnroll) {
+            increaseUnrollMemoryForThisThread(size)
+            increaseReservedUnrollMemoryForThisThread(size)
+          } else {
+            increaseTryToPutMemoryForThisThread(size)
+            decreaseUnrollMemoryForThisThread(size)
+          }
           enoughFreeSpace = true
           logInfo(selectedBlocks.size + " blocks selected for dropping")
           ResultBlocksIdMemory(success = true, selectedBlocks.toSeq, selectedMemory)
-
         } else {
 logInfo(s"ensureFreeSpaceForTryToPut Will not store $blockIdToAdd as it would require" + 
     s" dropping another block from the same RDD")
