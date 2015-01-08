@@ -749,7 +749,7 @@ private[spark] class Master(
       } finally {
         logInput.close()
       }
-      a ppIdToUI(app.id) = ui
+      appIdToUI(app.id) = ui
       webUi.attachSparkUI(ui)
       // Application UI is successfully rebuilt, so link the Master UI to it
       app.desc.appUiUrl = ui.basePath
@@ -855,7 +855,7 @@ private[spark] class MasterActorSupervisor
     }
 
   def receive = {
-    case p: Props => sender ! context.actorOf(p)
+    case p: Props => sender ! context.actorOf(p, "Master")
     case _ => logWarning("received unknown message in DAGSchedulerActorSupervisor")
   }
 }
