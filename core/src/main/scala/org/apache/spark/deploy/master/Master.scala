@@ -749,7 +749,7 @@ private[spark] class Master(
       } finally {
         logInput.close()
       }
-      appIdToUI(app.id) = ui
+      a ppIdToUI(app.id) = ui
       webUi.attachSparkUI(ui)
       // Application UI is successfully rebuilt, so link the Master UI to it
       app.desc.appUiUrl = ui.basePath
@@ -842,9 +842,27 @@ private[spark] class Master(
   }
 }
 
+import akka.actor.SupervisorStrategy.Resume
+private[spark] class MasterActorSupervisor
+  extends Actor with Logging {
+
+  override val supervisorStrategy =
+    OneForOneStrategy() {
+      case x: Exception =>
+        logError("Master Actor failed encounting exception; shutting down SparkContext", x)
+        logInfo("hahahahah ....... now, we are resuming the master")
+        Resume
+    }
+
+  def receive = {
+    case p: Props => sender ! context.actorOf(p)
+    case _ => logWarning("received unknown message in DAGSchedulerActorSupervisor")
+  }
+}
+
 private[spark] object Master extends Logging {
   val systemName = "sparkMaster"
-  private val actorName = "Master"
+  private val actorName = "MasterSupervisor/Master"
   val sparkUrlRegex = "spark://([^:]+):([0-9]+)".r
 
   def main(argStrings: Array[String]) {
@@ -873,11 +891,28 @@ private[spark] object Master extends Logging {
     val securityMgr = new SecurityManager(conf)
     val (actorSystem, boundPort) = AkkaUtils.createActorSystem(systemName, host, port, conf = conf,
       securityManager = securityMgr)
-    val actor = actorSystem.actorOf(Props(classOf[Master], host, boundPort, webUiPort,
-      securityMgr), actorName)
-    val timeout = AkkaUtils.askTimeout(conf)
-    val respFuture = actor.ask(RequestWebUIPort)(timeout)
-    val resp = Await.result(respFuture, timeout).asInstanceOf[WebUIPortResponse]
-    (actorSystem, boundPort, resp.webUIBoundPort)
+    val supervisorActor = actorSystem.actorOf(Props(classOf[MasterActorSupervisor]), "MasterSupervisor")
+import akka.util.Timeout
+logInfo("master supervisor created............")
+    implicit val timeout = Timeout(30 seconds)
+    val initMasterActorReply =
+      supervisorActor ? Props(new Master(host, boundPort, webUiPort,
+      securityMgr))
+    val masterActor = Await.result(initMasterActorReply, timeout.duration).
+      asInstanceOf[ActorRef]
+    val newTimeout = AkkaUtils.askTimeout(conf)
+    logInfo("master actor created now *********")
+    val respFuture = masterActor.ask(RequestWebUIPort)(newTimeout)
+    val resp = Await.result(respFuture, newTimeout).asInstanceOf[WebUIPortResponse]
+     (actorSystem, boundPort, resp.webUIBoundPort)
+    
+//    val (actorSystem, boundPort) = AkkaUtils.createActorSystem(systemName, host, port, conf = conf,
+//      securityManager = securityMgr)
+//    val actor = actorSystem.actorOf(Props(classOf[Master], host, boundPort, webUiPort,
+//      securityMgr), actorName)
+//    val timeout = AkkaUtils.askTimeout(conf)
+//    val respFuture = actor.ask(RequestWebUIPort)(timeout)
+//    val resp = Await.result(respFuture, timeout).asInstanceOf[WebUIPortResponse]
+//    (actorSystem, boundPort, resp.webUIBoundPort)
   }
 }
