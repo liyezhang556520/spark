@@ -30,6 +30,7 @@ import scala.util.control.NonFatal
 import org.apache.spark._
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.memory.TaskMemoryManager
+import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.scheduler.{DirectTaskResult, IndirectTaskResult, Task}
 import org.apache.spark.shuffle.FetchFailedException
 import org.apache.spark.storage.{StorageLevel, TaskResultBlockId}
@@ -85,9 +86,11 @@ private[spark] class Executor(
     env.blockManager.initialize(conf.getAppId)
   }
 
-  // Create an RpcEndpoint for receiving RPCs from the driver
-  private val executorEndpoint = env.rpcEnv.setupEndpoint(
-    ExecutorEndpoint.EXECUTOR_ENDPOINT_NAME, new ExecutorEndpoint(env.rpcEnv, executorId))
+  private val executorMetrics: ExecutorMetrics = new ExecutorMetrics
+  executorMetrics.setHostname(Utils.localHostName)
+  if (env.rpcEnv.address != null) {
+    executorMetrics.setPort(Some(env.rpcEnv.address.port))
+  }
 
   // Whether to load classes in user jars before those in Spark jars
   private val userClassPathFirst = conf.getBoolean("spark.executor.userClassPathFirst", false)
@@ -113,6 +116,10 @@ private[spark] class Executor(
   // Executor for the heartbeat task.
   private val heartbeater = ThreadUtils.newDaemonSingleThreadScheduledExecutor("driver-heartbeater")
 
+  // must be initialized before running startDriverHeartbeat()
+  private val heartbeatReceiverRef =
+    RpcUtils.makeDriverRef(HeartbeatReceiver.ENDPOINT_NAME, conf, env.rpcEnv)
+
   startDriverHeartbeater()
 
   def launchTask(
@@ -136,7 +143,6 @@ private[spark] class Executor(
 
   def stop(): Unit = {
     env.metricsSystem.report()
-    env.rpcEnv.stop(executorEndpoint)
     heartbeater.shutdown()
     heartbeater.awaitTermination(10, TimeUnit.SECONDS)
     threadPool.shutdown()
@@ -365,9 +371,9 @@ private[spark] class Executor(
         val _userClassPathFirst: java.lang.Boolean = userClassPathFirst
         val klass = Utils.classForName("org.apache.spark.repl.ExecutorClassLoader")
           .asInstanceOf[Class[_ <: ClassLoader]]
-        val constructor = klass.getConstructor(classOf[SparkConf], classOf[String],
-          classOf[ClassLoader], classOf[Boolean])
-        constructor.newInstance(conf, classUri, parent, _userClassPathFirst)
+        val constructor = klass.getConstructor(classOf[SparkConf], classOf[SparkEnv],
+          classOf[String], classOf[ClassLoader], classOf[Boolean])
+        constructor.newInstance(conf, env, classUri, parent, _userClassPathFirst)
       } catch {
         case _: ClassNotFoundException =>
           logError("Could not find org.apache.spark.repl.ExecutorClassLoader on classpath!")
@@ -416,9 +422,6 @@ private[spark] class Executor(
     }
   }
 
-  private val heartbeatReceiverRef =
-    RpcUtils.makeDriverRef(HeartbeatReceiver.ENDPOINT_NAME, conf, env.rpcEnv)
-
   /** Reports heartbeat and metrics for active tasks to the driver. */
   private def reportHeartBeat(): Unit = {
     // list of (task id, metrics) to send back to the driver
@@ -434,7 +437,7 @@ private[spark] class Executor(
           metrics.updateAccumulators()
 
           if (isLocal) {
-            // JobProgressListener will hold an reference of it during
+            // JobProgressListener will hold a reference of it during
             // onExecutorMetricsUpdate(), then JobProgressListener can not see
             // the changes of metrics any more, so make a deep copy of it
             val copiedMetrics = Utils.deserialize[TaskMetrics](Utils.serialize(metrics))
@@ -447,9 +450,22 @@ private[spark] class Executor(
       }
     }
 
-    val message = Heartbeat(executorId, tasksMetrics.toArray, env.blockManager.blockManagerId)
+    env.blockTransferService.getMemMetrics(this.executorMetrics)
+    val executorMetrics = if (isLocal) {
+      // JobProgressListener might hold a reference of it during onExecutorMetricsUpdate()
+      // in future, if then JobProgressListener cannot see the changes of metrics any
+      // more, so make a deep copy of it here for future change.
+      Utils.deserialize[ExecutorMetrics](Utils.serialize(this.executorMetrics))
+    } else {
+      this.executorMetrics
+    }
+
+    val message = Heartbeat(
+      executorId, executorMetrics, tasksMetrics.toArray, env.blockManager.blockManagerId)
+
     try {
-      val response = heartbeatReceiverRef.askWithRetry[HeartbeatResponse](message)
+      val response = heartbeatReceiverRef.askWithRetry[HeartbeatResponse](
+          message, RpcTimeout(conf, "spark.executor.heartbeatInterval", "10s"))
       if (response.reregisterBlockManager) {
         logInfo("Told to re-register on heartbeat")
         env.blockManager.reregister()

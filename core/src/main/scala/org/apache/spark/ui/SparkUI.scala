@@ -17,19 +17,23 @@
 
 package org.apache.spark.ui
 
-import java.util.Date
+import java.util.{Date, ServiceLoader}
 
-import org.apache.spark.status.api.v1.{ApiRootResource, ApplicationAttemptInfo, ApplicationInfo,
-  UIRoot}
+import scala.collection.JavaConverters._
+
 import org.apache.spark.{Logging, SecurityManager, SparkConf, SparkContext}
 import org.apache.spark.scheduler._
+import org.apache.spark.status.api.v1.{ApiRootResource, ApplicationAttemptInfo, ApplicationInfo,
+  UIRoot}
 import org.apache.spark.storage.StorageStatusListener
 import org.apache.spark.ui.JettyUtils._
 import org.apache.spark.ui.env.{EnvironmentListener, EnvironmentTab}
 import org.apache.spark.ui.exec.{ExecutorsListener, ExecutorsTab}
-import org.apache.spark.ui.jobs.{JobsTab, JobProgressListener, StagesTab}
-import org.apache.spark.ui.storage.{StorageListener, StorageTab}
+import org.apache.spark.ui.jobs.{JobProgressListener, JobsTab, StagesTab}
+import org.apache.spark.ui.memory.{MemoryListener, MemoryTab}
 import org.apache.spark.ui.scope.RDDOperationGraphListener
+import org.apache.spark.ui.storage.{StorageListener, StorageTab}
+import org.apache.spark.util.Utils
 
 /**
  * Top level user interface for a Spark application.
@@ -43,6 +47,7 @@ private[spark] class SparkUI private (
     val executorsListener: ExecutorsListener,
     val jobProgressListener: JobProgressListener,
     val storageListener: StorageListener,
+    val memoryListener: MemoryListener,
     val operationGraphListener: RDDOperationGraphListener,
     var appName: String,
     val basePath: String,
@@ -65,6 +70,7 @@ private[spark] class SparkUI private (
     attachTab(new StorageTab(this))
     attachTab(new EnvironmentTab(this))
     attachTab(new ExecutorsTab(this))
+    attachTab(new MemoryTab(this))
     attachHandler(createStaticHandler(SparkUI.STATIC_RESOURCE_DIR, "/static"))
     attachHandler(createRedirectHandler("/", "/jobs/", basePath = basePath))
     attachHandler(ApiRootResource.getServletHandler(this))
@@ -154,7 +160,16 @@ private[spark] object SparkUI {
       appName: String,
       basePath: String,
       startTime: Long): SparkUI = {
-    create(None, conf, listenerBus, securityManager, appName, basePath, startTime = startTime)
+    val sparkUI = create(
+      None, conf, listenerBus, securityManager, appName, basePath, startTime = startTime)
+
+    val listenerFactories = ServiceLoader.load(classOf[SparkHistoryListenerFactory],
+      Utils.getContextOrSparkClassLoader).asScala
+    listenerFactories.foreach { listenerFactory =>
+      val listeners = listenerFactory.createListeners(conf, sparkUI)
+      listeners.foreach(listenerBus.addListener)
+    }
+    sparkUI
   }
 
   /**
@@ -184,16 +199,18 @@ private[spark] object SparkUI {
     val storageStatusListener = new StorageStatusListener
     val executorsListener = new ExecutorsListener(storageStatusListener)
     val storageListener = new StorageListener(storageStatusListener)
+    val memoryListener = new MemoryListener
     val operationGraphListener = new RDDOperationGraphListener(conf)
 
     listenerBus.addListener(environmentListener)
     listenerBus.addListener(storageStatusListener)
     listenerBus.addListener(executorsListener)
     listenerBus.addListener(storageListener)
+    listenerBus.addListener(memoryListener)
     listenerBus.addListener(operationGraphListener)
 
     new SparkUI(sc, conf, securityManager, environmentListener, storageStatusListener,
-      executorsListener, _jobProgressListener, storageListener, operationGraphListener,
-      appName, basePath, startTime)
+      executorsListener, _jobProgressListener, storageListener, memoryListener,
+      operationGraphListener, appName, basePath, startTime)
   }
 }

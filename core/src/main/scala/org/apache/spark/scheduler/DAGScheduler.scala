@@ -24,6 +24,7 @@ import java.util.concurrent.atomic.AtomicInteger
 
 import scala.collection.Map
 import scala.collection.mutable.{HashMap, HashSet, Stack}
+import scala.concurrent.Await
 import scala.concurrent.duration._
 import scala.language.existentials
 import scala.language.postfixOps
@@ -33,13 +34,14 @@ import org.apache.commons.lang3.SerializationUtils
 
 import org.apache.spark._
 import org.apache.spark.broadcast.Broadcast
-import org.apache.spark.executor.TaskMetrics
+import org.apache.spark.executor.{ExecutorMetrics, TaskMetrics}
+import org.apache.spark.network.util.JavaUtils
 import org.apache.spark.partial.{ApproximateActionListener, ApproximateEvaluator, PartialResult}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.rpc.RpcTimeout
 import org.apache.spark.storage._
-import org.apache.spark.util._
 import org.apache.spark.storage.BlockManagerMessages.BlockManagerHeartbeat
+import org.apache.spark.util._
 
 /**
  * The high-level scheduling layer that implements stage-oriented scheduling. It computes a DAG of
@@ -130,7 +132,7 @@ class DAGScheduler(
 
   def this(sc: SparkContext) = this(sc, sc.taskScheduler)
 
-  private[scheduler] val metricsSource: DAGSchedulerSource = new DAGSchedulerSource(this)
+  private[spark] val metricsSource: DAGSchedulerSource = new DAGSchedulerSource(this)
 
   private[scheduler] val nextJobId = new AtomicInteger(0)
   private[scheduler] def numTotalJobs: Int = nextJobId.get()
@@ -214,15 +216,16 @@ class DAGScheduler(
   }
 
   /**
-   * Update metrics for in-progress tasks and let the master know that the BlockManager is still
-   * alive. Return true if the driver knows about the given block manager. Otherwise, return false,
-   * indicating that the block manager should re-register.
+   * Update metrics for live executor and in-progress tasks and let the master know that the
+   * BlockManager is still alive. Return true if the driver knows about the given block manager.
+   * Otherwise, return false, indicating that the block manager should re-register.
    */
   def executorHeartbeatReceived(
       execId: String,
+      executorMetrics: ExecutorMetrics,
       taskMetrics: Array[(Long, Int, Int, TaskMetrics)], // (taskId, stageId, stateAttempt, metrics)
       blockManagerId: BlockManagerId): Boolean = {
-    listenerBus.post(SparkListenerExecutorMetricsUpdate(execId, taskMetrics))
+    listenerBus.post(SparkListenerExecutorMetricsUpdate(execId, executorMetrics, taskMetrics))
     blockManagerMaster.driverEndpoint.askWithRetry[Boolean](
       BlockManagerHeartbeat(blockManagerId), new RpcTimeout(600 seconds, "BlockManagerHeartbeat"))
   }
@@ -609,11 +612,12 @@ class DAGScheduler(
       properties: Properties): Unit = {
     val start = System.nanoTime
     val waiter = submitJob(rdd, func, partitions, callSite, resultHandler, properties)
-    waiter.awaitResult() match {
-      case JobSucceeded =>
+    Await.ready(waiter.completionFuture, atMost = Duration.Inf)
+    waiter.completionFuture.value.get match {
+      case scala.util.Success(_) =>
         logInfo("Job %d finished: %s, took %f s".format
           (waiter.jobId, callSite.shortForm, (System.nanoTime - start) / 1e9))
-      case JobFailed(exception: Exception) =>
+      case scala.util.Failure(exception) =>
         logInfo("Job %d failed: %s, took %f s".format
           (waiter.jobId, callSite.shortForm, (System.nanoTime - start) / 1e9))
         // SPARK-8644: Include user stack trace in exceptions coming from DAGScheduler.
@@ -744,7 +748,7 @@ class DAGScheduler(
   }
 
   /**
-   * Check for waiting or failed stages which are now eligible for resubmission.
+   * Check for waiting stages which are now eligible for resubmission.
    * Ordinarily run on every iteration of the event loop.
    */
   private def submitWaitingStages() {
@@ -802,7 +806,8 @@ class DAGScheduler(
 
   private[scheduler] def cleanUpAfterSchedulerStop() {
     for (job <- activeJobs) {
-      val error = new SparkException("Job cancelled because SparkContext was shut down")
+      val error =
+        new SparkException(s"Job ${job.jobId} cancelled because SparkContext was shut down")
       job.listener.jobFailed(error)
       // Tell the listeners that all of the running stages have ended.  Don't bother
       // cancelling the stages because if the DAG scheduler is stopped, the entire application
@@ -946,7 +951,9 @@ class DAGScheduler(
       stage.resetInternalAccumulators()
     }
 
-    val properties = jobIdToActiveJob.get(stage.firstJobId).map(_.properties).orNull
+    // Use the scheduling pool, job group, description, etc. from an ActiveJob associated
+    // with this Stage
+    val properties = jobIdToActiveJob(jobId).properties
 
     runningStages += stage
     // SparkListenerStageSubmitted should be posted before testing whether tasks are
@@ -995,9 +1002,10 @@ class DAGScheduler(
       // For ResultTask, serialize and broadcast (rdd, func).
       val taskBinaryBytes: Array[Byte] = stage match {
         case stage: ShuffleMapStage =>
-          closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef).array()
+          JavaUtils.bufferToArray(
+            closureSerializer.serialize((stage.rdd, stage.shuffleDep): AnyRef))
         case stage: ResultStage =>
-          closureSerializer.serialize((stage.rdd, stage.func): AnyRef).array()
+          JavaUtils.bufferToArray(closureSerializer.serialize((stage.rdd, stage.func): AnyRef))
       }
 
       taskBinary = sc.broadcast(taskBinaryBytes)
@@ -1047,7 +1055,7 @@ class DAGScheduler(
       stage.pendingPartitions ++= tasks.map(_.partitionId)
       logDebug("New pending partitions: " + stage.pendingPartitions)
       taskScheduler.submitTasks(new TaskSet(
-        tasks.toArray, stage.id, stage.latestInfo.attemptId, stage.firstJobId, properties))
+        tasks.toArray, stage.id, stage.latestInfo.attemptId, jobId, properties))
       stage.latestInfo.submissionTime = Some(clock.getTimeMillis())
     } else {
       // Because we posted SparkListenerStageSubmitted earlier, we should mark
@@ -1289,7 +1297,7 @@ class DAGScheduler(
       case TaskResultLost =>
         // Do nothing here; the TaskScheduler handles these failures and resubmits the task.
 
-      case other =>
+      case _: ExecutorLostFailure | TaskKilled | UnknownReason =>
         // Unrecognized failure - also do nothing. If the task fails repeatedly, the TaskScheduler
         // will abort the job.
     }
@@ -1574,14 +1582,11 @@ class DAGScheduler(
   }
 
   def stop() {
-    logInfo("Stopping DAGScheduler")
     messageScheduler.shutdownNow()
     eventProcessLoop.stop()
     taskScheduler.stop()
   }
 
-  // Start the event thread and register the metrics source at the end of the constructor
-  env.metricsSystem.registerSource(metricsSource)
   eventProcessLoop.start()
 }
 

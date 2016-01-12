@@ -17,8 +17,10 @@
 
 package org.apache.spark.sql.jdbc
 
-import org.apache.spark.sql.types._
+import java.sql.Connection
+
 import org.apache.spark.annotation.DeveloperApi
+import org.apache.spark.sql.types._
 
 /**
  * :: DeveloperApi ::
@@ -29,7 +31,7 @@ import org.apache.spark.annotation.DeveloperApi
  *                     send a null value to the database.
  */
 @DeveloperApi
-case class JdbcType(databaseTypeDefinition : String, jdbcNullType : Int)
+case class JdbcType(databaseTypeDefinition: String, jdbcNullType: Int)
 
 /**
  * :: DeveloperApi ::
@@ -51,14 +53,14 @@ case class JdbcType(databaseTypeDefinition : String, jdbcNullType : Int)
  * for the given Catalyst type.
  */
 @DeveloperApi
-abstract class JdbcDialect {
+abstract class JdbcDialect extends Serializable {
   /**
    * Check if this dialect instance can handle a certain jdbc url.
    * @param url the jdbc url.
    * @return True if the dialect can be applied on the given jdbc url.
    * @throws NullPointerException if the url is null.
    */
-  def canHandle(url : String): Boolean
+  def canHandle(url: String): Boolean
 
   /**
    * Get the custom datatype mapping for the given jdbc meta information.
@@ -97,6 +99,15 @@ abstract class JdbcDialect {
     s"SELECT * FROM $table WHERE 1=0"
   }
 
+  /**
+    * Override connection specific properties to run before a select is made.  This is in place to
+    * allow dialects that need special treatment to optimize behavior.
+    * @param connection The connection object
+    * @param properties The connection properties.  This is passed through from the relation.
+    */
+  def beforeFetch(connection: Connection, properties: Map[String, String]): Unit = {
+  }
+
 }
 
 /**
@@ -119,7 +130,7 @@ object JdbcDialects {
    *
    * @param dialect The new dialect.
    */
-  def registerDialect(dialect: JdbcDialect) : Unit = {
+  def registerDialect(dialect: JdbcDialect): Unit = {
     dialects = dialect :: dialects.filterNot(_ == dialect)
   }
 
@@ -128,7 +139,7 @@ object JdbcDialects {
    *
    * @param dialect The jdbc dialect.
    */
-  def unregisterDialect(dialect : JdbcDialect) : Unit = {
+  def unregisterDialect(dialect: JdbcDialect): Unit = {
     dialects = dialects.filterNot(_ == dialect)
   }
 
@@ -158,5 +169,5 @@ object JdbcDialects {
  * NOOP dialect object, always returning the neutral element.
  */
 private object NoopDialect extends JdbcDialect {
-  override def canHandle(url : String): Boolean = true
+  override def canHandle(url: String): Boolean = true
 }

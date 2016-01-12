@@ -22,21 +22,19 @@ import java.util.*;
 
 import scala.Tuple2;
 
-import com.google.common.base.Optional;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import org.junit.Assert;
 import org.junit.Test;
 
+import org.apache.spark.Accumulator;
 import org.apache.spark.HashPartitioner;
 import org.apache.spark.api.java.JavaPairRDD;
 import org.apache.spark.api.java.JavaRDD;
-import org.apache.spark.api.java.function.Function2;
-import org.apache.spark.api.java.function.Function4;
 import org.apache.spark.api.java.function.PairFunction;
 import org.apache.spark.streaming.api.java.JavaDStream;
 import org.apache.spark.streaming.api.java.JavaPairDStream;
-import org.apache.spark.streaming.api.java.JavaTrackStateDStream;
+import org.apache.spark.streaming.api.java.JavaMapWithStateDStream;
 
 /**
  * Most of these tests replicate org.apache.spark.streaming.JavaAPISuite using java 8
@@ -361,6 +359,31 @@ public class Java8APISuite extends LocalJavaStreamingContext implements Serializ
   }
 
   @Test
+  public void testForeachRDD() {
+    final Accumulator<Integer> accumRdd = ssc.sc().accumulator(0);
+    final Accumulator<Integer> accumEle = ssc.sc().accumulator(0);
+    List<List<Integer>> inputData = Arrays.asList(
+        Arrays.asList(1,1,1),
+        Arrays.asList(1,1,1));
+
+    JavaDStream<Integer> stream = JavaTestUtils.attachTestInputStream(ssc, inputData, 1);
+    JavaTestUtils.attachTestOutputStream(stream.count()); // dummy output
+
+    stream.foreachRDD(rdd -> {
+      accumRdd.add(1);
+      rdd.foreach(x -> accumEle.add(1));
+    });
+
+    // This is a test to make sure foreachRDD(VoidFunction2) can be called from Java
+    stream.foreachRDD((rdd, time) -> null);
+
+    JavaTestUtils.runStreams(ssc, 2, 2);
+
+    Assert.assertEquals(2, accumRdd.value().intValue());
+    Assert.assertEquals(6, accumEle.value().intValue());
+  }
+
+  @Test
   public void testPairFlatMap() {
     List<List<String>> inputData = Arrays.asList(
       Arrays.asList("giants"),
@@ -415,9 +438,14 @@ public class Java8APISuite extends LocalJavaStreamingContext implements Serializ
    */
   public static <T extends Comparable<T>> void assertOrderInvariantEquals(
     List<List<T>> expected, List<List<T>> actual) {
-    expected.forEach((List<T> list) -> Collections.sort(list));
-    actual.forEach((List<T> list) -> Collections.sort(list));
-    Assert.assertEquals(expected, actual);
+    expected.forEach(list -> Collections.sort(list));
+    List<List<T>> sortedActual = new ArrayList<>();
+    actual.forEach(list -> {
+        List<T> sortedList = new ArrayList<>(list);
+        Collections.sort(sortedList);
+        sortedActual.add(sortedList);
+    });
+    Assert.assertEquals(expected, sortedActual);
   }
 
   @Test
@@ -837,12 +865,12 @@ public class Java8APISuite extends LocalJavaStreamingContext implements Serializ
   /**
    * This test is only for testing the APIs. It's not necessary to run it.
    */
-  public void testTrackStateByAPI() {
+  public void testMapWithStateAPI() {
     JavaPairRDD<String, Boolean> initialRDD = null;
     JavaPairDStream<String, Integer> wordsDstream = null;
 
-    JavaTrackStateDStream<String, Integer, Boolean, Double> stateDstream =
-        wordsDstream.trackStateByKey(
+    JavaMapWithStateDStream<String, Integer, Boolean, Double> stateDstream =
+        wordsDstream.mapWithState(
             StateSpec.<String, Integer, Boolean, Double> function((time, key, value, state) -> {
               // Use all State's methods here
               state.exists();
@@ -858,9 +886,9 @@ public class Java8APISuite extends LocalJavaStreamingContext implements Serializ
 
     JavaPairDStream<String, Boolean> emittedRecords = stateDstream.stateSnapshots();
 
-    JavaTrackStateDStream<String, Integer, Boolean, Double> stateDstream2 =
-        wordsDstream.trackStateByKey(
-            StateSpec.<String, Integer, Boolean, Double>function((value, state) -> {
+    JavaMapWithStateDStream<String, Integer, Boolean, Double> stateDstream2 =
+        wordsDstream.mapWithState(
+            StateSpec.<String, Integer, Boolean, Double>function((key, value, state) -> {
               state.exists();
               state.get();
               state.isTimingOut();
@@ -872,6 +900,6 @@ public class Java8APISuite extends LocalJavaStreamingContext implements Serializ
                 .partitioner(new HashPartitioner(10))
                 .timeout(Durations.seconds(10)));
 
-    JavaPairDStream<String, Boolean> emittedRecords2 = stateDstream2.stateSnapshots();
+    JavaPairDStream<String, Boolean> mappedDStream = stateDstream2.stateSnapshots();
   }
 }

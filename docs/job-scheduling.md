@@ -47,7 +47,7 @@ application is not running tasks on a machine, other applications may run tasks 
 is useful when you expect large numbers of not overly active applications, such as shell sessions from
 separate users. However, it comes with a risk of less predictable latency, because it may take a while for
 an application to gain back cores on one node when it has work to do. To use this mode, simply use a
-`mesos://` URL without setting `spark.mesos.coarse` to true.
+`mesos://` URL and set `spark.mesos.coarse` to false.
 
 Note that none of the modes currently provide memory sharing across applications. If you would like to share
 data this way, we recommend running a single server application that can serve multiple requests by querying
@@ -91,7 +91,7 @@ pre-packaged distribution.
 2. Add this jar to the classpath of all `NodeManager`s in your cluster.
 3. In the `yarn-site.xml` on each node, add `spark_shuffle` to `yarn.nodemanager.aux-services`,
 then set `yarn.nodemanager.aux-services.spark_shuffle.class` to
-`org.apache.spark.network.yarn.YarnShuffleService` and `spark.shuffle.service.enabled` to true.
+`org.apache.spark.network.yarn.YarnShuffleService`.
 4. Restart all `NodeManager`s in your cluster.
 
 All other relevant configurations are optional and under the `spark.dynamicAllocation.*` and
